@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<title>Hi!</title>
+</head>
+
+<body>
+	<input id="input" autofocus/>
+	<p id="result"></p>
+</body>
+
+<style>
+p {
+	white-space: pre;
+}
+</style>
+
+<script type="module">
+const input = document.getElementById("input");
+const result = document.getElementById("result");
+
+
+let buffer = "";
+const importObject = {
+	env: {
+		jsPrint: (ptr, len) => {
+			const source = new Uint8Array(module.instance.exports.memory.buffer, ptr, len);
+			buffer += (new TextDecoder()).decode(source);
+		},
+		jsFlush: () => {
+			console.info(buffer);
+			result.textContent += buffer;
+			buffer = "";
+		}
+	},
+};
+
+const module = await WebAssembly.instantiateStreaming(fetch("web.wasm"), importObject);
+
+async function evalExpression(text) {
+	const encodedString = (new TextEncoder()).encode(text);
+	const stringAddress = module.instance.exports.alloc(encodedString.length);
+	try {
+		const destination = new Uint8Array(module.instance.exports.memory.buffer, stringAddress);
+		destination.set(encodedString);
+		const result = module.instance.exports.eval(stringAddress, encodedString.length);
+	} finally {
+		module.instance.exports.free(stringAddress);
+	}
+}
+
+console.info("Input", input);
+input.addEventListener("input", (event) => {
+	console.info("event", event.target.value);
+	result.textContent = "";
+	evalExpression(event.target.value);
+});
+await evalExpression(input.value);
+</script>
+</html>

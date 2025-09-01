@@ -1,0 +1,3 @@
+*.o
+cli
+web/*.wasm
