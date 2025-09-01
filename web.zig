@@ -7,16 +7,29 @@ extern fn jsPrint(ptr: [*]const u8, len: usize) void;
 extern fn jsFlush() void;
 const Logger = struct {
     pub const Error = error{};
-    pub const Writer = std.io.Writer(void, Error, write);
-    fn write(_: void, bytes: []const u8) Error!usize {
-        jsPrint(bytes.ptr, bytes.len);
-        return bytes.len;
+    writer: std.io.Writer,
+    fn init() @This() {
+        return .{
+            .writer = .{
+                .buffer = &[_]u8{},
+                .vtable = &.{ .drain = @This().drain },
+            },
+        };
+    }
+    fn drain(_: *std.io.Writer, data: []const []const u8, splat: usize) Error!usize {
+        var written: usize = 0;
+        for (data[0 .. data.len - 1]) |slice| {
+            jsPrint(slice.ptr, slice.len);
+            written += slice.len;
+        }
+        for (0..splat) |_| jsPrint(data[data.len - 1].ptr, data[data.len - 1].len);
+        return written + splat * data[data.len - 1].len;
     }
 };
 
-const logger = Logger.Writer{ .context = {} };
 pub fn print(comptime format: []const u8, args: anytype) void {
-    logger.print(format, args) catch return;
+    var logger = Logger.init();
+    logger.writer.print(format, args) catch return;
     jsFlush();
 }
 
@@ -42,10 +55,10 @@ export fn eval(ptr: usize, len: usize) void {
         print("couldn't create parser: {}", .{err});
         return;
     };
-    const parseResult = myParser.parse() catch |err| {
+    const parseResult = myParser.parse_and_simplify() catch |err| {
         print("couldn't parse: {}", .{err});
         return;
     };
     defer parseResult.arena.deinit();
-    print("Input \"{s}\" output \"{s}\"", .{ val, parseResult.expression });
+    print("Input \"{s}\" output \"{f}\"", .{ val, parseResult.expression });
 }

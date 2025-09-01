@@ -118,19 +118,19 @@ test "Tokenise IntLit" {
 const Expression = union(enum) {
     integer: i32,
     variable: []const u8,
-    product: std.ArrayList(Expression),
-    sum: std.ArrayList(Expression),
+    product: std.ArrayListUnmanaged(Expression),
+    sum: std.ArrayListUnmanaged(Expression),
     power: *[2]Expression,
 
     const Self = @This();
     /// Useful for displaying expressions nicely
-    pub fn format(self: *const Self, comptime fmt: []const u8, options: FormatOptions, writer: anytype) !void {
+    pub fn format(self: *const Self, writer: anytype) !void {
         switch (self.*) {
             .integer => |value| try writer.print("{}", .{value}),
             .variable => |name| try writer.print("{s}", .{name}),
             .product => |terms| {
                 for (terms.items) |value| {
-                    try writer.print("({})", .{value});
+                    try writer.print("({f})", .{value});
                 }
             },
             .sum => |terms| {
@@ -138,10 +138,10 @@ const Expression = union(enum) {
                     if (index != 0) {
                         try writer.print(" + ", .{});
                     }
-                    try value.format(fmt, options, writer);
+                    try value.format(writer);
                 }
             },
-            .power => |power| try writer.print("( {} )^( {} )", .{ power[0], power[1] }),
+            .power => |power| try writer.print("( {f} )^( {f} )", .{ power[0], power[1] }),
         }
     }
     /// Construct a power expression
@@ -153,14 +153,14 @@ const Expression = union(enum) {
     }
     /// Construct a sum expression
     pub fn newSum(slice: []const Expression, alloc: std.mem.Allocator) std.mem.Allocator.Error!Expression {
-        var list = std.ArrayList(Expression).init(alloc);
-        try list.appendSlice(slice);
+        var list: std.ArrayListUnmanaged(Expression) = .empty;
+        try list.appendSlice(alloc, slice);
         return Expression{ .sum = list };
     }
     /// Construct a product expression
     pub fn newProduct(slice: []const Expression, alloc: std.mem.Allocator) std.mem.Allocator.Error!Expression {
-        var list = std.ArrayList(Expression).init(alloc);
-        try list.appendSlice(slice);
+        var list: std.ArrayListUnmanaged(Expression) = .empty;
+        try list.appendSlice(alloc, slice);
         return Expression{ .product = list };
     }
     /// Construct an integer expression
@@ -208,7 +208,7 @@ const Expression = union(enum) {
                 while (index < terms.items.len) {
                     try terms.items[index].collapsed_nested(alloc);
                     switch (terms.items[index]) {
-                        .product => |*product| try terms.replaceRange(index, 1, product.items),
+                        .product => |*product| try terms.replaceRange(alloc, index, 1, product.items),
                         else => index += 1,
                     }
                 }
@@ -222,7 +222,7 @@ const Expression = union(enum) {
                 while (index < terms.items.len) {
                     try terms.items[index].collapsed_nested(alloc);
                     switch (terms.items[index]) {
-                        .sum => |*sum| try terms.replaceRange(index, 1, sum.items),
+                        .sum => |*sum| try terms.replaceRange(alloc, index, 1, sum.items),
                         else => index += 1,
                     }
                 }
@@ -247,7 +247,7 @@ const Expression = union(enum) {
             .integer, .variable => {},
         }
     }
-    fn without_multiple(self: *Self) std.mem.Allocator.Error!i32 {
+    fn without_multiple(self: *Self, alloc: std.mem.Allocator) std.mem.Allocator.Error!i32 {
         switch (self.*) {
             .product => |*p| {
                 var count: i32 = 1;
@@ -261,7 +261,7 @@ const Expression = union(enum) {
                         else => index += 1,
                     }
                 }
-                try self.collapsed_nested(p.allocator);
+                try self.collapsed_nested(alloc);
                 return count;
             },
             .integer => |count| {
@@ -280,14 +280,14 @@ const Expression = union(enum) {
     fn collect_like_terms(self: *Self, alloc: std.mem.Allocator) std.mem.Allocator.Error!void {
         switch (self.*) {
             .sum => |*oldTerms| {
-                var newTerms = std.ArrayList(Expression).init(alloc);
+                var newTerms: std.ArrayListUnmanaged(Expression) = .empty;
                 for (oldTerms.items) |*oldTerm| {
-                    const oldMultiple = try oldTerm.without_multiple();
+                    const oldMultiple = try oldTerm.without_multiple(alloc);
                     var canConsolidate = false;
                     for (newTerms.items) |*newTerm| {
-                        var new = try newTerm.without_multiple();
+                        var new = try newTerm.without_multiple(alloc);
                         canConsolidate = newTerm == oldTerm;
-                        print("New {} old {} consolidate {}\n", .{ newTerm, oldTerm, canConsolidate });
+                        print("New {f} old {f} consolidate {}\n", .{ newTerm, oldTerm, canConsolidate });
                         if (canConsolidate) {
                             new += oldMultiple;
                         }
@@ -300,7 +300,7 @@ const Expression = union(enum) {
                     if (!canConsolidate) {
                         var value = try Expression.newProduct(&[_]Expression{ Expression.newInteger(oldMultiple), oldTerm.* }, alloc);
                         try value.collapsed_nested(alloc);
-                        try newTerms.append(value);
+                        try newTerms.append(alloc, value);
                     }
                 }
                 oldTerms.* = newTerms;
@@ -462,8 +462,12 @@ pub const Parser = struct {
             print("Unparsed token {?}\n", .{self.current});
         }
         try expression.collapsed_nested(self.allocator());
-        try expression.collect_like_terms(self.allocator());
         return .{ .expression = expression, .arena = self.arena };
+    }
+    pub fn parse_and_simplify(self: *Self) !ParseResult {
+        var result = try self.parse();
+        try result.expression.collect_like_terms(self.allocator());
+        return result;
     }
 };
 
@@ -471,7 +475,7 @@ pub const Parser = struct {
 fn testParser(source: []const u8) !Parser.ParseResult {
     var parser = try Parser.new(std.testing.allocator, source);
     const parsed = try parser.parse();
-    print("source {s}\nparsed {}\n", .{ source, parsed.expression });
+    print("source {s}\nparsed {f}\n", .{ source, parsed.expression });
     return parsed;
 }
 
