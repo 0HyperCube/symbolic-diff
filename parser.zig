@@ -114,9 +114,89 @@ test "Tokenise IntLit" {
     try expect((try tokeniser.next()), null);
 }
 
+/// Check if two lists of expressions are equal, ignoring the ordering
+fn compare_unordered_expressions(alloc: std.mem.Allocator, a: *const std.ArrayListUnmanaged(Expression), b: *const std.ArrayListUnmanaged(Expression)) error{OutOfMemory}!bool {
+    if (a.items.len != b.items.len) {
+        return false;
+    }
+    var used_b: std.ArrayListUnmanaged(bool) = .empty;
+    defer used_b.deinit(alloc);
+    try used_b.appendNTimes(alloc, false, a.items.len);
+    for (a.items) |needle| {
+        var found = false;
+        for (b.items, used_b.items) |haystack, *used| {
+            if (used.*) {
+                return false;
+            }
+            if (try haystack.equals(alloc, &needle)) {
+                used.* = true;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            return false;
+        }
+    }
+    return true;
+}
+
+const lcm = std.math.lcm;
+const gcd = std.math.gcd;
+
+const Numeric = struct {
+    numerator: i32,
+    denominator: u32,
+
+    const Self = @This();
+    pub fn add(self: Self, other: Self) Self {
+        const denominator = lcm(self.denominator, other.denominator);
+        const numerator = @as(i32, @intCast(@divExact(denominator, self.denominator))) * self.numerator + @as(i32, @intCast(@divExact(denominator, other.denominator))) * other.numerator;
+        return (Self{ .denominator = denominator, .numerator = numerator }).simplified();
+    }
+    pub fn multiply(self: Self, other: Self) Self {
+        const numerator = self.numerator * other.numerator;
+        const denominator = self.denominator * other.denominator;
+        return (Self{ .denominator = denominator, .numerator = numerator }).simplified();
+    }
+    /// Useful for displaying expressions nicely
+    pub fn format(self: *const Self, writer: anytype) !void {
+        if (self.denominator == 0) {
+            try writer.print("DivZeroError", .{});
+        } else if (self.denominator == 1) {
+            try writer.print("{}", .{self.numerator});
+        } else {
+            try writer.print("({}/{})", .{ self.numerator, self.denominator });
+        }
+    }
+    pub fn power(self: Self, exponent: i32) error{ Overflow, Underflow }!Self {
+        var result = Self{ .numerator = try std.math.powi(i32, self.numerator, @intCast(@abs(exponent))), .denominator = try std.math.powi(u32, self.denominator, @abs(exponent)) };
+        if (exponent < 0) {
+            result = Self{ .numerator = std.math.sign(result.numerator) * @as(i32, @intCast(result.denominator)), .denominator = @abs(result.numerator) };
+        }
+        return result;
+    }
+    pub fn new(value: i32) Self {
+        return Self{ .numerator = value, .denominator = 1 };
+    }
+    pub fn simplified(self: Self) Self {
+        const divisor = gcd(@abs(self.denominator), @abs(self.numerator));
+
+        return Self{
+            .denominator = @abs(@divExact(self.denominator, divisor)),
+            .numerator = @divExact(self.numerator, @as(i32, @intCast(divisor))),
+        };
+    }
+    pub fn equals(self: Self, other: Self) bool {
+        return self.simplified().numerator == other.simplified().numerator and self.simplified().denominator == other.simplified().denominator;
+    }
+    pub const ZERO = Self{ .numerator = 0, .denominator = 1 };
+    pub const ONE = Self{ .numerator = 1, .denominator = 1 };
+};
+
 /// An expression is the equivilant of an abstract base class.
 const Expression = union(enum) {
-    integer: i32,
+    integer: Numeric,
     variable: []const u8,
     product: std.ArrayListUnmanaged(Expression),
     sum: std.ArrayListUnmanaged(Expression),
@@ -126,7 +206,7 @@ const Expression = union(enum) {
     /// Useful for displaying expressions nicely
     pub fn format(self: *const Self, writer: anytype) !void {
         switch (self.*) {
-            .integer => |value| try writer.print("{}", .{value}),
+            .integer => |value| try writer.print("{f}", .{value}),
             .variable => |name| try writer.print("{s}", .{name}),
             .product => |terms| {
                 for (terms.items) |value| {
@@ -165,7 +245,11 @@ const Expression = union(enum) {
     }
     /// Construct an integer expression
     pub fn newInteger(value: i32) Expression {
-        return Expression{ .integer = value };
+        return Expression{ .integer = Numeric.new(value) };
+    }
+    /// Construct a numeric expression
+    pub fn newNumeric(numeric: Numeric) Expression {
+        return Expression{ .integer = numeric };
     }
     /// Construct a variable epxression
     pub fn newVariable(name: []const u8) Expression {
@@ -179,29 +263,33 @@ const Expression = union(enum) {
     fn recip(self: Self, alloc: std.mem.Allocator) std.mem.Allocator.Error!Expression {
         return Self.newPower(self, Expression.newInteger(-1), alloc);
     }
-    // fn cmp(_: void, a: Self, b: Self) bool {
-    //     switch (a) {
-    //         .integer => return false,
-    //         .variable => |name| try writer.print("{s}", .{name}),
-    //         .product => |terms| {
-    //             for (terms.items) |value| {
-    //                 try writer.print("({})", .{value});
-    //             }
-    //         },
-    //         .sum => |terms| {
-    //             for (terms.items, 0..terms.items.len) |value, index| {
-    //                 if (index != 0) {
-    //                     try writer.print(" + ", .{});
-    //                 }
-    //                 try value.format(fmt, options, writer);
-    //             }
-    //         },
-    //         .power => |power| try writer.print("( {} )^( {} )", .{ power[0], power[1] }),
-    //     }
-    //     return a > b;
-    // }
+    /// Does one expression equal another?
+    fn equals(a: *const Self, alloc: std.mem.Allocator, b: *const Self) std.mem.Allocator.Error!bool {
+        return switch (a.*) {
+            .integer => |first| switch (b.*) {
+                .integer => |second| first.equals(second),
+                else => false,
+            },
+            .variable => |first| switch (b.*) {
+                .variable => |second| std.mem.eql(u8, second, first),
+                else => false,
+            },
+            .product => |first| switch (b.*) {
+                .product => |second| return try compare_unordered_expressions(alloc, &first, &second),
+                else => false,
+            },
+            .sum => |first| switch (b.*) {
+                .sum => |second| return try compare_unordered_expressions(alloc, &first, &second),
+                else => false,
+            },
+            .power => |first| switch (b.*) {
+                .power => |second| try first[0].equals(alloc, &second[0]) and try first[1].equals(alloc, &second[1]),
+                else => false,
+            },
+        };
+    }
     /// Collapse e.g. a sum of sums becomes a single sum
-    fn collapsed_nested(self: *Self, alloc: std.mem.Allocator) std.mem.Allocator.Error!void {
+    fn collapsed_nested(self: *Self, alloc: std.mem.Allocator) error{ Overflow, Underflow, OutOfMemory }!void {
         switch (self.*) {
             .product => |*terms| {
                 var index: usize = 0;
@@ -212,9 +300,10 @@ const Expression = union(enum) {
                         else => index += 1,
                     }
                 }
-                // std.mem.sort(u8, terms, {}, comptime std.sort.desc(u8));
                 if (terms.items.len == 0) {
                     self.* = Expression.newInteger(1);
+                } else if (terms.items.len == 1) {
+                    self.* = terms.items[0];
                 }
             },
             .sum => |*terms| {
@@ -226,9 +315,10 @@ const Expression = union(enum) {
                         else => index += 1,
                     }
                 }
-                // std.mem.sort(u8, terms, {}, comptime std.sort.desc(u8));
                 if (terms.items.len == 0) {
                     self.* = Expression.newInteger(0);
+                } else if (terms.items.len == 1) {
+                    self.* = terms.items[0];
                 }
             },
             .power => |power| {
@@ -236,9 +326,24 @@ const Expression = union(enum) {
                 try power[1].collapsed_nested(alloc);
                 switch (power[0]) {
                     .power => |inner| {
+                        // Collapse nested powers
                         power[0] = inner[0];
                         power[1] = try Expression.newProduct(&[_]Expression{ inner[1], power[1] }, alloc);
                         try power[1].collapsed_nested(alloc);
+                    },
+                    .integer => |base| switch (power[1]) {
+                        // Expand integer powers
+                        .integer => |exponent| if (exponent.denominator == 1) {
+                            self.* = Expression.newNumeric(try base.power(exponent.numerator));
+                        },
+                        else => {},
+                    },
+                    else => {},
+                }
+                // Simplify power of 1
+                switch (power[1]) {
+                    .integer => |exponent| if (exponent.equals(Numeric.ONE)) {
+                        self.* = power[0];
                     },
                     else => {},
                 }
@@ -247,15 +352,15 @@ const Expression = union(enum) {
             .integer, .variable => {},
         }
     }
-    fn without_multiple(self: *Self, alloc: std.mem.Allocator) std.mem.Allocator.Error!i32 {
+    fn without_multiple(self: *Self, alloc: std.mem.Allocator) error{ OutOfMemory, Overflow, Underflow }!Numeric {
         switch (self.*) {
             .product => |*p| {
-                var count: i32 = 1;
+                var count = Numeric.ZERO;
                 var index: usize = 0;
                 while (index < p.items.len) {
                     switch (p.items[index]) {
                         .integer => |i| {
-                            count *= i;
+                            count = count.multiply(i);
                             _ = p.swapRemove(index);
                         },
                         else => index += 1,
@@ -268,16 +373,26 @@ const Expression = union(enum) {
                 self.* = Expression.newInteger(1);
                 return count;
             },
-            else => return 1,
+            else => return Numeric.ONE,
         }
     }
-    // fn consolidate_sum(self: *self, other: Expression) std.mem.Allocator.Error!bool {
-    //     switch (other) {
-    //         .product =>
-    //     }
-    // }
+    fn without_power(self: *Self) Numeric {
+        switch (self.*) {
+            .power => |p| {
+                switch (p[1]) {
+                    .integer => |i| {
+                        self.* = p[0];
+                        return i;
+                    },
+                    else => return Numeric.ONE,
+                }
+            },
+            else => return Numeric.ONE,
+        }
+    }
+
     /// Collect like terms e.g. x + 2 + 2x becomes 3x + 2
-    fn collect_like_terms(self: *Self, alloc: std.mem.Allocator) std.mem.Allocator.Error!void {
+    fn collect_like_terms(self: *Self, alloc: std.mem.Allocator) error{ OutOfMemory, Overflow, Underflow }!void {
         switch (self.*) {
             .sum => |*oldTerms| {
                 var newTerms: std.ArrayListUnmanaged(Expression) = .empty;
@@ -286,22 +401,63 @@ const Expression = union(enum) {
                     var canConsolidate = false;
                     for (newTerms.items) |*newTerm| {
                         var new = try newTerm.without_multiple(alloc);
-                        canConsolidate = newTerm == oldTerm;
-                        print("New {f} old {f} consolidate {}\n", .{ newTerm, oldTerm, canConsolidate });
+                        try newTerm.collapsed_nested(alloc);
+                        canConsolidate = try newTerm.equals(alloc, oldTerm);
                         if (canConsolidate) {
-                            new += oldMultiple;
+                            new = new.add(oldMultiple);
                         }
-                        newTerm.* = try Expression.newProduct(&[_]Expression{ Expression.newInteger(new), newTerm.* }, alloc);
+                        newTerm.* = try Expression.newProduct(&[_]Expression{ Expression.newNumeric(new), newTerm.* }, alloc);
                         try newTerm.collapsed_nested(alloc);
                         if (canConsolidate) {
                             break;
                         }
                     }
                     if (!canConsolidate) {
-                        var value = try Expression.newProduct(&[_]Expression{ Expression.newInteger(oldMultiple), oldTerm.* }, alloc);
+                        var value = try Expression.newProduct(&[_]Expression{ Expression.newNumeric(oldMultiple), oldTerm.* }, alloc);
                         try value.collapsed_nested(alloc);
                         try newTerms.append(alloc, value);
                     }
+                }
+                oldTerms.* = newTerms;
+            },
+            .product => |*oldTerms| {
+                var newTerms: std.ArrayListUnmanaged(Expression) = .empty;
+                var multiple = Numeric.ONE;
+                for (oldTerms.items) |*oldTerm| {
+
+                    // Raw numeric literals should just be multiples
+                    switch (oldTerm.*) {
+                        .integer => |i| {
+                            multiple = multiple.multiply(i);
+                            continue;
+                        },
+                        else => {},
+                    }
+
+                    const oldPower = oldTerm.without_power();
+                    var canConsolidate = false;
+                    for (newTerms.items) |*newTerm| {
+                        var newPowers = newTerm.without_power();
+                        try newTerm.collapsed_nested(alloc);
+                        canConsolidate = try newTerm.equals(alloc, oldTerm);
+                        if (canConsolidate) {
+                            newPowers = newPowers.add(oldPower);
+                        }
+                        newTerm.* = try Expression.newPower(newTerm.*, Expression.newNumeric(newPowers), alloc);
+                        try newTerm.collapsed_nested(alloc);
+
+                        if (canConsolidate) {
+                            break;
+                        }
+                    }
+                    if (!canConsolidate) {
+                        var value = try Expression.newPower(oldTerm.*, Expression.newNumeric(oldPower), alloc);
+                        try value.collapsed_nested(alloc);
+                        try newTerms.append(alloc, value);
+                    }
+                }
+                if (!multiple.equals(Numeric.ONE)) {
+                    try newTerms.insert(alloc, 0, Expression.newNumeric(multiple));
                 }
                 oldTerms.* = newTerms;
             },
