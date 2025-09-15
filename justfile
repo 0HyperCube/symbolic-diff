@@ -5,7 +5,7 @@ web: build-web
 	python3 -m http.server 8080 -d web
 
 test:
-	zig test parser.zig -freference-trace=99
+	zig test parser.zig
 
 clean:
 	rm -f *.o *.wasm cli

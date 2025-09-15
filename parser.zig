@@ -126,7 +126,7 @@ fn compare_unordered_expressions(alloc: std.mem.Allocator, a: *const std.ArrayLi
         var found = false;
         for (b.items, used_b.items) |haystack, *used| {
             if (used.*) {
-                return false;
+                continue;
             }
             if (try haystack.equals(alloc, &needle)) {
                 used.* = true;
@@ -297,6 +297,14 @@ const Expression = union(enum) {
                     try terms.items[index].collapsed_nested(alloc);
                     switch (terms.items[index]) {
                         .product => |*product| try terms.replaceRange(alloc, index, 1, product.items),
+                        .integer => |*integer| {
+                            // One is identity
+                            if (integer.equals(Numeric.ONE)) {
+                                _ = terms.swapRemove(index);
+                            } else {
+                                index += 1;
+                            }
+                        },
                         else => index += 1,
                     }
                 }
@@ -312,6 +320,14 @@ const Expression = union(enum) {
                     try terms.items[index].collapsed_nested(alloc);
                     switch (terms.items[index]) {
                         .sum => |*sum| try terms.replaceRange(alloc, index, 1, sum.items),
+                        // Zero identity
+                        .integer => |*integer| {
+                            if (integer.equals(Numeric.ZERO)) {
+                                _ = terms.swapRemove(index);
+                            } else {
+                                index += 1;
+                            }
+                        },
                         else => index += 1,
                     }
                 }
@@ -355,7 +371,7 @@ const Expression = union(enum) {
     fn without_multiple(self: *Self, alloc: std.mem.Allocator) error{ OutOfMemory, Overflow, Underflow }!Numeric {
         switch (self.*) {
             .product => |*p| {
-                var count = Numeric.ZERO;
+                var count = Numeric.ONE;
                 var index: usize = 0;
                 while (index < p.items.len) {
                     switch (p.items[index]) {
@@ -622,7 +638,7 @@ pub const Parser = struct {
     }
     pub fn parse_and_simplify(self: *Self) !ParseResult {
         var result = try self.parse();
-        try result.expression.collect_like_terms(self.allocator());
+        try result.expression.collect_like_terms(result.arena.allocator());
         return result;
     }
 };
@@ -633,6 +649,29 @@ fn testParser(source: []const u8) !Parser.ParseResult {
     const parsed = try parser.parse();
     print("source {s}\nparsed {f}\n", .{ source, parsed.expression });
     return parsed;
+}
+
+/// A utilty for testing the parser
+fn testSimplified(source: []const u8) !Parser.ParseResult {
+    var parser = try Parser.new(std.testing.allocator, source);
+    const result = try parser.parse_and_simplify();
+    print("source {s}\nparsed & simplified {f}\n", .{ source, result.expression });
+    return result;
+}
+fn expr_equals(expr: *const Expression, expected: []const u8) !void {
+    var parser = try Parser.new(std.testing.allocator, expected);
+    const parsed = try parser.parse();
+    const is_equal = try expr.equals(std.testing.allocator, &parsed.expression);
+    defer parsed.arena.deinit();
+    if (!is_equal) {
+        print("------\nFAIL:\n  source:\t{f}\n  expected:\t{f}\n", .{ expr, parsed.expression });
+        return error.ExprNotEq;
+    }
+}
+fn simplified_source_eq(source: []const u8, expected: []const u8) !void {
+    var parsed = try testSimplified(source);
+    defer parsed.arena.deinit();
+    try expr_equals(&parsed.expression, expected);
 }
 
 test "Parse IntLit" {
@@ -648,11 +687,11 @@ test "Parse Double negative" {
     try expect(expected, parsed.expression.product.items);
 }
 test "Parse order of operations" {
-    var parsed = try testParser("1 * 2 + 3 * 4");
+    var parsed = try testParser("7 * 2 + 3 * 4");
     defer parsed.arena.deinit();
     const sum = parsed.expression.sum.items;
     try expect(2, sum.len);
-    try expect(&[_]Expression{ Expression.newInteger(1), Expression.newInteger(2) }, sum[0].product.items);
+    try expect(&[_]Expression{ Expression.newInteger(7), Expression.newInteger(2) }, sum[0].product.items);
     try expect(&[_]Expression{ Expression.newInteger(3), Expression.newInteger(4) }, sum[1].product.items);
 }
 test "Parse implicit multiplication" {
@@ -664,4 +703,26 @@ test "Parse implicit multiplication" {
     const power = product[1].power;
     try expect(Expression.newVariable("a"), power[0]);
     try expect(Expression.newInteger(3), power[1]);
+}
+test "Equals" {
+    try simplified_source_eq("3", "3");
+    try simplified_source_eq("a", "a");
+    try simplified_source_eq("a3", "3a");
+    try simplified_source_eq("2+3a", "3a+2");
+    try simplified_source_eq("2-b+3a", "-b+3a+2");
+
+    try std.testing.expectError(error.ExprNotEq, simplified_source_eq("3 a b", "3a"));
+    try std.testing.expectError(error.ExprNotEq, simplified_source_eq("3+a", "3+a+b"));
+}
+test "Simplify add" {
+    try simplified_source_eq("2a+a", "3a");
+    try simplified_source_eq("a+a", "2a");
+    try simplified_source_eq("a-a", "0a");
+    try simplified_source_eq("a+b+2a+5b", "3a+6b");
+}
+test "Simplify product" {
+    try simplified_source_eq("2a*a*a", "2a^3");
+    try simplified_source_eq("a a", "a^2");
+    try simplified_source_eq("a b a b", "a^2 b^2");
+    try simplified_source_eq("a / a", "a^0");
 }
