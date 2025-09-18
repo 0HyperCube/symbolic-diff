@@ -301,6 +301,10 @@ const Expression = union(enum) {
                             // One is identity
                             if (integer.equals(Numeric.ONE)) {
                                 _ = terms.swapRemove(index);
+                            } else if (integer.equals(Numeric.ZERO)) {
+                                // Result is zero
+                                self.* = Expression.newInteger(0);
+                                return;
                             } else {
                                 index += 1;
                             }
@@ -356,10 +360,13 @@ const Expression = union(enum) {
                     },
                     else => {},
                 }
-                // Simplify power of 1
                 switch (power[1]) {
                     .integer => |exponent| if (exponent.equals(Numeric.ONE)) {
+                        // Simplify power of 1
                         self.* = power[0];
+                    } else if (exponent.equals(Numeric.ZERO)) {
+                        // Simplify power of 0
+                        self.* = Expression.newInteger(1);
                     },
                     else => {},
                 }
@@ -407,12 +414,72 @@ const Expression = union(enum) {
         }
     }
 
+    /// Expand (x+1)(x-1)
+    fn expand_brakets(self: *Self, alloc: std.mem.Allocator) error{ OutOfMemory, Overflow, Underflow }!void {
+        switch (self.*) {
+            .sum => |terms| for (terms.items) |*term| {
+                try term.expand_brakets(alloc);
+            },
+            .product => |terms| {
+                var expanded: std.ArrayListUnmanaged(Expression) = .empty;
+                var sum_indexes: std.ArrayListUnmanaged(usize) = .empty;
+                try sum_indexes.appendNTimes(alloc, 0, terms.items.len);
+                while (true) {
+                    var got_new = false;
+                    var next_term: std.ArrayListUnmanaged(Expression) = .empty;
+                    try next_term.ensureTotalCapacityPrecise(alloc, terms.items.len);
+                    for (terms.items, sum_indexes.items, 0..) |term, sum_index, index| {
+                        switch (term) {
+                            .sum => |sum| {
+                                next_term.appendAssumeCapacity(sum.items[sum_index]);
+                                if (!got_new and sum_index < sum.items.len - 1) {
+                                    got_new = true;
+                                    // Reset all previous sum indexes
+                                    for (sum_indexes.items[0..index]) |*item| {
+                                        item.* = 0;
+                                    }
+                                    sum_indexes.items[index] += 1;
+                                }
+                            },
+                            else => {
+                                next_term.appendAssumeCapacity(term);
+                            },
+                        }
+                    }
+                    try expanded.append(alloc, Expression{ .product = next_term });
+                    if (!got_new) {
+                        break;
+                    }
+                }
+                self.* = Expression{ .sum = expanded };
+            },
+            .power => |values| {
+                switch (values[1]) {
+                    // Expand integer powers
+                    .integer => |i| if (i.denominator == 1 and i.numerator > 0) {
+                        var list: std.ArrayListUnmanaged(Expression) = .empty;
+                        try list.appendNTimes(alloc, values[0], @intCast(i.numerator));
+                        self.* = Expression{ .product = list };
+
+                        try self.expand_brakets(alloc);
+                    },
+                    else => {
+                        try values[0].expand_brakets(alloc);
+                        try values[1].expand_brakets(alloc);
+                    },
+                }
+            },
+            .integer, .variable => {},
+        }
+    }
+
     /// Collect like terms e.g. x + 2 + 2x becomes 3x + 2
     fn collect_like_terms(self: *Self, alloc: std.mem.Allocator) error{ OutOfMemory, Overflow, Underflow }!void {
         switch (self.*) {
             .sum => |*oldTerms| {
                 var newTerms: std.ArrayListUnmanaged(Expression) = .empty;
                 for (oldTerms.items) |*oldTerm| {
+                    try oldTerm.collect_like_terms(alloc);
                     const oldMultiple = try oldTerm.without_multiple(alloc);
                     var canConsolidate = false;
                     for (newTerms.items) |*newTerm| {
@@ -440,6 +507,7 @@ const Expression = union(enum) {
                 var newTerms: std.ArrayListUnmanaged(Expression) = .empty;
                 var multiple = Numeric.ONE;
                 for (oldTerms.items) |*oldTerm| {
+                    try oldTerm.collect_like_terms(alloc);
 
                     // Raw numeric literals should just be multiples
                     switch (oldTerm.*) {
@@ -477,7 +545,11 @@ const Expression = union(enum) {
                 }
                 oldTerms.* = newTerms;
             },
-            else => {},
+            .power => |values| {
+                try values[0].collect_like_terms(alloc);
+                try values[1].collect_like_terms(alloc);
+            },
+            .integer, .variable => {},
         }
         try self.collapsed_nested(alloc);
     }
@@ -638,6 +710,7 @@ pub const Parser = struct {
     }
     pub fn parse_and_simplify(self: *Self) !ParseResult {
         var result = try self.parse();
+        try result.expression.expand_brakets(result.arena.allocator());
         try result.expression.collect_like_terms(result.arena.allocator());
         return result;
     }
@@ -647,7 +720,7 @@ pub const Parser = struct {
 fn testParser(source: []const u8) !Parser.ParseResult {
     var parser = try Parser.new(std.testing.allocator, source);
     const parsed = try parser.parse();
-    print("source {s}\nparsed {f}\n", .{ source, parsed.expression });
+    print("source: {s: <15}parsed: {f}\n", .{ source, parsed.expression });
     return parsed;
 }
 
@@ -655,16 +728,17 @@ fn testParser(source: []const u8) !Parser.ParseResult {
 fn testSimplified(source: []const u8) !Parser.ParseResult {
     var parser = try Parser.new(std.testing.allocator, source);
     const result = try parser.parse_and_simplify();
-    print("source {s}\nparsed & simplified {f}\n", .{ source, result.expression });
+    print("source: {s: <15}parsed & simplified: {f}\n", .{ source, result.expression });
     return result;
 }
 fn expr_equals(expr: *const Expression, expected: []const u8) !void {
     var parser = try Parser.new(std.testing.allocator, expected);
-    const parsed = try parser.parse();
+    var parsed = try parser.parse();
+    try parsed.expression.collect_like_terms(parsed.arena.allocator());
     const is_equal = try expr.equals(std.testing.allocator, &parsed.expression);
     defer parsed.arena.deinit();
     if (!is_equal) {
-        print("------\nFAIL:\n  source:\t{f}\n  expected:\t{f}\n", .{ expr, parsed.expression });
+        print("{s}\nFAIL:\n  source:\t{f}\n  expected:\t{f}\n", .{ "-" ** 30, expr, parsed.expression });
         return error.ExprNotEq;
     }
 }
@@ -717,12 +791,20 @@ test "Equals" {
 test "Simplify add" {
     try simplified_source_eq("2a+a", "3a");
     try simplified_source_eq("a+a", "2a");
-    try simplified_source_eq("a-a", "0a");
+    try simplified_source_eq("a-a", "0");
     try simplified_source_eq("a+b+2a+5b", "3a+6b");
+    try simplified_source_eq("a/3 - a/4", "a/12");
 }
 test "Simplify product" {
     try simplified_source_eq("2a*a*a", "2a^3");
+    try simplified_source_eq("2a*a*a+2b*b^4", "2a^3+2b^5");
     try simplified_source_eq("a a", "a^2");
     try simplified_source_eq("a b a b", "a^2 b^2");
-    try simplified_source_eq("a / a", "a^0");
+    try simplified_source_eq("a / a", "1");
+    try simplified_source_eq("a / a + b/b", "2");
+}
+test "Expand" {
+    try simplified_source_eq("(x+1)(x-1)", "x^2-1");
+    try simplified_source_eq("(x-1)^4", "x^4 + -4x^3 + 6x^2 + -4x + 1");
+    try simplified_source_eq("(a+b+c)(d+e+f)(g+h+i)", "a*d*g + b*d*g + c*d*g + a*e*g + b*e*g + c*e*g + a*f*g + b*f*g + c*f*g + a*d*h + b*d*h + c*d*h + a*e*h + b*e*h + c*e*h + a*f*h + b*f*h + c*f*h + a*d*i + b*d*i + c*d*i + a*e*i + b*e*i + c*e*i + a*f*i + b*f*i + c*f*i");
 }
