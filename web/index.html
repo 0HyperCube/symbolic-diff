@@ -1,7 +1,10 @@
 <!DOCTYPE html>
 <html>
 <head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width">
 	<title>Hi!</title>
+	<link rel="stylesheet" href="https://fred-wang.github.io/MathFonts/LatinModern/mathfonts.css" />
 </head>
 
 <body>
@@ -12,6 +15,15 @@
 <style>
 p {
 	white-space: pre;
+}
+
+html,body {
+  height: 100%;
+}
+
+#result {
+  display: grid;
+  font-size: 1.5rem;
 }
 </style>
 
@@ -29,7 +41,7 @@ const importObject = {
 		},
 		jsFlush: () => {
 			console.info(buffer);
-			result.textContent += buffer;
+			result.innerHTML += buffer;
 			buffer = "";
 		}
 	},
@@ -39,6 +51,7 @@ const module = await WebAssembly.instantiateStreaming(fetch("web.wasm"), importO
 
 async function evalExpression(text) {
 	const encodedString = (new TextEncoder()).encode(text);
+	if (encodedString.length === 0) return;
 	const stringAddress = module.instance.exports.alloc(encodedString.length);
 	try {
 		const destination = new Uint8Array(module.instance.exports.memory.buffer, stringAddress);

@@ -162,14 +162,14 @@ const Numeric = struct {
     denominator: u32,
 
     const Self = @This();
-    pub fn add(self: Self, other: Self) Self {
+    pub fn add(self: Self, other: Self) error{Overflow}!Self {
         const denominator = lcm(self.denominator, other.denominator);
-        const numerator = @as(i32, @intCast(@divExact(denominator, self.denominator))) * self.numerator + @as(i32, @intCast(@divExact(denominator, other.denominator))) * other.numerator;
+        const numerator = try std.math.add(i32, try std.math.mul(i32, @intCast(@divExact(denominator, self.denominator)), self.numerator), try std.math.mul(i32, @intCast(@divExact(denominator, other.denominator)), other.numerator));
         return (Self{ .denominator = denominator, .numerator = numerator }).simplified();
     }
-    pub fn multiply(self: Self, other: Self) Self {
-        const numerator = self.numerator * other.numerator;
-        const denominator = self.denominator * other.denominator;
+    pub fn multiply(self: Self, other: Self) error{Overflow}!Self {
+        const numerator = try std.math.mul(i32, self.numerator, other.numerator);
+        const denominator = try std.math.mul(u32, self.denominator, other.denominator);
         return (Self{ .denominator = denominator, .numerator = numerator }).simplified();
     }
     /// Useful for displaying expressions nicely
@@ -180,6 +180,15 @@ const Numeric = struct {
             try writer.print("{}", .{self.numerator});
         } else {
             try writer.print("({}/{})", .{ self.numerator, self.denominator });
+        }
+    }
+    pub fn formatMathML(self: *const Self, writer: anytype) !void {
+        if (self.denominator == 0) {
+            try writer.print("<mtext>DivZeroError</mtext>", .{});
+        } else if (self.denominator == 1) {
+            try writer.print("<mn>{}</mn>", .{self.numerator});
+        } else {
+            try writer.print("<mfrac><mn>{}</mn><mi>{}</mi></mfrac>", .{ self.numerator, self.denominator });
         }
     }
     pub fn power(self: Self, exponent: i32) error{ Overflow, Underflow }!Self {
@@ -237,6 +246,60 @@ const Expression = union(enum) {
             },
             .power => |power| try writer.print("( {f} )^( {f} )", .{ power[0], power[1] }),
             .factorial => |value| try writer.print("( {f} )!", .{value.*}),
+        }
+    }
+
+    fn start(writer: anytype, prec: Parser.Prec, my_prec: Parser.Prec) !void {
+        try writer.print("<mrow>", .{});
+        if (@as(usize, @intFromEnum(my_prec)) < @intFromEnum(prec)) {
+            try writer.print("<mo>(</mo>", .{});
+        }
+    }
+    fn end(writer: anytype, prec: Parser.Prec, my_prec: Parser.Prec) !void {
+        if (@as(usize, @intFromEnum(my_prec)) < @intFromEnum(prec)) {
+            try writer.print("<mo>)</mo>", .{});
+        }
+        try writer.print("</mrow>", .{});
+    }
+    /// Useful for displaying expressions nicely
+    pub fn formatMathML(self: *const Self, writer: anytype, alloc: std.mem.Allocator, prec: Parser.Prec) !void {
+        switch (self.*) {
+            .integer => |value| try value.formatMathML(writer),
+            .variable => |name| try writer.print("<mi>{s}</mi>", .{try htmlEscape(name, alloc)}),
+            .product => |terms| {
+                try start(writer, prec, Parser.Prec.Product);
+                for (terms.items, 0..) |value, index| {
+                    if (index != 0) {
+                        try writer.print("<mo>&#x2062;</mo>", .{});
+                    }
+                    try value.formatMathML(writer, alloc, Parser.Prec.Product);
+                }
+                try end(writer, prec, Parser.Prec.Product);
+            },
+            .sum => |terms| {
+                try start(writer, prec, Parser.Prec.Sum);
+                for (terms.items, 0..) |value, index| {
+                    if (index != 0) {
+                        try writer.print("<mo>+</mo>", .{});
+                    }
+                    try value.formatMathML(writer, alloc, Parser.Prec.Sum);
+                }
+                try end(writer, prec, Parser.Prec.Sum);
+            },
+            .power => |power| {
+                try start(writer, prec, Parser.Prec.Exponent);
+                try writer.print("<msup>", .{});
+                try power[0].formatMathML(writer, alloc, Parser.Prec.Exponent);
+                try power[1].formatMathML(writer, alloc, @enumFromInt(0));
+                try writer.print("</msup>", .{});
+                try end(writer, prec, Parser.Prec.Exponent);
+            },
+            .factorial => |value| {
+                try start(writer, prec, Parser.Prec.Call);
+                try value.formatMathML(writer, alloc, Parser.Prec.Call);
+                try writer.print("<mo>!</mo>", .{});
+                try end(writer, prec, Parser.Prec.Call);
+            },
         }
     }
     /// Construct a power expression
@@ -404,7 +467,7 @@ const Expression = union(enum) {
                             var result: i32 = 1;
                             var item: i32 = 1;
                             while (item <= max.numerator) {
-                                result *= item;
+                                result = try std.math.mul(i32, item, result);
                                 item += 1;
                             }
                             self.* = Expression.newInteger(result);
@@ -425,7 +488,7 @@ const Expression = union(enum) {
                 while (index < p.items.len) {
                     switch (p.items[index]) {
                         .integer => |i| {
-                            count = count.multiply(i);
+                            count = try count.multiply(i);
                             _ = p.swapRemove(index);
                         },
                         else => index += 1,
@@ -530,7 +593,7 @@ const Expression = union(enum) {
                         try newTerm.collapsed_nested(alloc);
                         canConsolidate = try newTerm.equals(alloc, oldTerm);
                         if (canConsolidate) {
-                            new = new.add(oldMultiple);
+                            new = try new.add(oldMultiple);
                         }
                         newTerm.* = try Expression.newProduct(&[_]Expression{ Expression.newNumeric(new), newTerm.* }, alloc);
                         try newTerm.collapsed_nested(alloc);
@@ -555,7 +618,7 @@ const Expression = union(enum) {
                     // Raw numeric literals should just be multiples
                     switch (oldTerm.*) {
                         .integer => |i| {
-                            multiple = multiple.multiply(i);
+                            multiple = try multiple.multiply(i);
                             continue;
                         },
                         else => {},
@@ -568,7 +631,7 @@ const Expression = union(enum) {
                         try newTerm.collapsed_nested(alloc);
                         canConsolidate = try newTerm.equals(alloc, oldTerm);
                         if (canConsolidate) {
-                            newPowers = newPowers.add(oldPower);
+                            newPowers = try newPowers.add(oldPower);
                         }
                         newTerm.* = try Expression.newPower(newTerm.*, Expression.newNumeric(newPowers), alloc);
                         try newTerm.collapsed_nested(alloc);
@@ -598,6 +661,40 @@ const Expression = union(enum) {
         try self.collapsed_nested(alloc);
     }
 };
+
+fn htmlEscape(value: []const u8, alloc: std.mem.Allocator) ![]u8 {
+    const Replacement = struct { u8, []const u8 };
+    const replacements = [_]Replacement{ .{ '&', "&amp;" }, .{ '<', "&lt;" }, .{ '>', "&gt;" }, .{ '"', "&quot;" }, .{ '\'', "&#39;" } };
+    var size = value.len;
+    for (replacements) |replace| {
+        const instances = std.mem.count(u8, value, &[_]u8{replace[0]});
+        const new_len = replace[1].len - 1;
+        size += instances * new_len;
+    }
+
+    var output = try alloc.alloc(u8, size);
+    var index: usize = 0;
+    next_char: for (value) |source| {
+        for (replacements) |replace| {
+            if (replace[0] == source) {
+                for (replace[1]) |replace_source_char| {
+                    output[index] = replace_source_char;
+                    index += 1;
+                }
+                continue :next_char;
+            }
+        }
+        output[index] = source;
+        index += 1;
+    }
+    return output;
+}
+
+test "html esc" {
+    const result = try htmlEscape("a<\">", std.testing.allocator);
+    try expect("a&lt;&quot;&gt;", result);
+    std.testing.allocator.free(result);
+}
 
 /// The parser converts the input text into an abstract synatx tree (AST)
 pub const Parser = struct {
@@ -648,8 +745,8 @@ pub const Parser = struct {
         // There is probably a way to convert a slice to a number but I implemented it manually for fun
         var value: i32 = 0;
         for (token.index..token.index + token.length) |index| {
-            value *= 10;
-            value += self.tokeniser.source[index] - '0';
+            value = try std.math.mul(i32, value, 10);
+            value = try std.math.add(i32, value, self.tokeniser.source[index] - '0');
         }
         return Expression.newInteger(value);
     }
@@ -747,20 +844,28 @@ pub const Parser = struct {
         return expression;
     }
 
-    pub const ParseResult = struct { expression: Expression, arena: std.heap.ArenaAllocator };
+    pub const ParseResult = struct {
+        expression: Expression,
+        arena: std.heap.ArenaAllocator,
+
+        pub fn simplify(result: *ParseResult) !void {
+            try result.expression.collapsed_nested(result.arena.allocator());
+            try result.expression.expand_brakets(result.arena.allocator());
+            try result.expression.collect_like_terms(result.arena.allocator());
+        }
+    };
     pub fn parse(self: *Self) !ParseResult {
         // Parse with lowest prec
-        var expression = try self.parseWithPrec(@enumFromInt(0));
+        const expression = try self.parseWithPrec(@enumFromInt(0));
         if (self.current != null) {
             print("Unparsed token {?}\n", .{self.current});
         }
-        try expression.collapsed_nested(self.allocator());
         return .{ .expression = expression, .arena = self.arena };
     }
+
     pub fn parse_and_simplify(self: *Self) !ParseResult {
         var result = try self.parse();
-        try result.expression.expand_brakets(result.arena.allocator());
-        try result.expression.collect_like_terms(result.arena.allocator());
+        try result.simplify();
         return result;
     }
 };
@@ -768,7 +873,8 @@ pub const Parser = struct {
 /// A utilty for testing the parser
 fn testParser(source: []const u8) !Parser.ParseResult {
     var parser = try Parser.new(std.testing.allocator, source);
-    const parsed = try parser.parse();
+    var parsed = try parser.parse();
+    try parsed.expression.collapsed_nested(parsed.allocator());
     print("source: {s: <15}parsed: {f}\n", .{ source, parsed.expression });
     return parsed;
 }
@@ -783,6 +889,7 @@ fn testSimplified(source: []const u8) !Parser.ParseResult {
 fn expr_equals(expr: *const Expression, expected: []const u8) !void {
     var parser = try Parser.new(std.testing.allocator, expected);
     var parsed = try parser.parse();
+    try parsed.expression.collapsed_nested(parsed.allocator());
     try parsed.expression.collect_like_terms(parsed.arena.allocator());
     const is_equal = try expr.equals(std.testing.allocator, &parsed.expression);
     defer parsed.arena.deinit();

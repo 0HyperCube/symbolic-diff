@@ -55,10 +55,23 @@ export fn eval(ptr: usize, len: usize) void {
         print("couldn't create parser: {}", .{err});
         return;
     };
-    const parseResult = myParser.parse_and_simplify() catch |err| {
+    var parseResult = myParser.parse() catch |err| {
         print("couldn't parse: {}", .{err});
         return;
     };
     defer parseResult.arena.deinit();
-    print("Input \"{s}\" output \"{f}\"", .{ val, parseResult.expression });
+
+    var logger = Logger.init();
+    logger.writer.print("Input <math display=\"inline\">", .{}) catch return;
+    parseResult.expression.formatMathML(&logger.writer, parseResult.arena.allocator(), @enumFromInt(0)) catch return;
+    logger.writer.print("</math>", .{}) catch return;
+
+    parseResult.simplify() catch |err| {
+        print("couldn't simplify: {}", .{err});
+        return;
+    };
+    logger.writer.print("Output <math display=\"inline\">", .{}) catch return;
+    parseResult.expression.formatMathML(&logger.writer, parseResult.arena.allocator(), @enumFromInt(0)) catch return;
+    logger.writer.print("</math>", .{}) catch return;
+    jsFlush();
 }
