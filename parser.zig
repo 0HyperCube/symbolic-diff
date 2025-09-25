@@ -11,7 +11,7 @@ pub const print: fn (
 /// e.g. 'sin(2x)' -> ['sin', '(', '2', 'x', ')']
 pub const Tokeniser = struct {
     /// Possible types for each token
-    const TokenType = enum { Integer, Literal, Add, Subtract, Multiply, Divide, Power, OpenBracket, CloseBracket };
+    const TokenType = enum { Integer, Literal, Add, Subtract, Multiply, Divide, Power, Exclaim, OpenBracket, CloseBracket };
 
     /// Token including type, position, and length. This position information can be used to determine what integer literal is used.
     const Token = struct {
@@ -76,6 +76,7 @@ pub const Tokeniser = struct {
             '+' => return self.makeToken(TokenType.Add),
             '-' => return self.makeToken(TokenType.Subtract),
             '^' => return self.makeToken(TokenType.Power),
+            '!' => return self.makeToken(TokenType.Exclaim),
             '0'...'9' => {
                 while (!self.isDone() and '0' <= self.peek() and self.peek() <= '9') {
                     self.index += 1;
@@ -83,9 +84,13 @@ pub const Tokeniser = struct {
                 return self.makeToken(TokenType.Integer);
             },
             'a'...'z', 'A'...'Z', '_' => {
-                while (!self.isDone() and (('a' <= self.peek() and self.peek() <= 'z') or ('A' <= self.peek() and self.peek() <= 'Z') or self.peek() == '_')) {
+                if (!self.isDone() and self.peek() == '_') {
                     self.index += 1;
+                    while (!self.isDone() and (('a' <= self.peek() and self.peek() <= 'z') or ('A' <= self.peek() and self.peek() <= 'Z') or self.peek() == '_')) {
+                        self.index += 1;
+                    }
                 }
+
                 return self.makeToken(TokenType.Literal);
             },
             else => {
@@ -103,7 +108,8 @@ test "Tokenise Int" {
     try expect((try tokeniser.next()), null);
 }
 test "Tokenise Literal" {
-    var tokeniser = Tokeniser.new("  aA_BzZ  ");
+    var tokeniser = Tokeniser.new("  aA_B  ");
+    try expect((try tokeniser.next()).?.ty, Tokeniser.TokenType.Literal);
     try expect((try tokeniser.next()).?.ty, Tokeniser.TokenType.Literal);
     try expect((try tokeniser.next()), null);
 }
@@ -111,6 +117,13 @@ test "Tokenise IntLit" {
     var tokeniser = Tokeniser.new("2a");
     try expect((try tokeniser.next()).?.ty, Tokeniser.TokenType.Integer);
     try expect((try tokeniser.next()).?.ty, Tokeniser.TokenType.Literal);
+    try expect((try tokeniser.next()), null);
+}
+test "Tokenise Factorial" {
+    var tokeniser = Tokeniser.new("2a!");
+    try expect((try tokeniser.next()).?.ty, Tokeniser.TokenType.Integer);
+    try expect((try tokeniser.next()).?.ty, Tokeniser.TokenType.Literal);
+    try expect((try tokeniser.next()).?.ty, Tokeniser.TokenType.Exclaim);
     try expect((try tokeniser.next()), null);
 }
 
@@ -201,6 +214,7 @@ const Expression = union(enum) {
     product: std.ArrayListUnmanaged(Expression),
     sum: std.ArrayListUnmanaged(Expression),
     power: *[2]Expression,
+    factorial: *Expression,
 
     const Self = @This();
     /// Useful for displaying expressions nicely
@@ -222,6 +236,7 @@ const Expression = union(enum) {
                 }
             },
             .power => |power| try writer.print("( {f} )^( {f} )", .{ power[0], power[1] }),
+            .factorial => |value| try writer.print("( {f} )!", .{value.*}),
         }
     }
     /// Construct a power expression
@@ -259,6 +274,12 @@ const Expression = union(enum) {
     fn negate(self: Self, alloc: std.mem.Allocator) std.mem.Allocator.Error!Expression {
         return Self.newProduct(&[_]Expression{ self, Expression.newInteger(-1) }, alloc);
     }
+    /// Factorial
+    fn newFactorial(self: Self, alloc: std.mem.Allocator) std.mem.Allocator.Error!Expression {
+        const fact = try alloc.create(Expression);
+        fact.* = self;
+        return Expression{ .factorial = fact };
+    }
     /// Reciprical of the current expression by rasining to the power of -1
     fn recip(self: Self, alloc: std.mem.Allocator) std.mem.Allocator.Error!Expression {
         return Self.newPower(self, Expression.newInteger(-1), alloc);
@@ -284,6 +305,10 @@ const Expression = union(enum) {
             },
             .power => |first| switch (b.*) {
                 .power => |second| try first[0].equals(alloc, &second[0]) and try first[1].equals(alloc, &second[1]),
+                else => false,
+            },
+            .factorial => |first| switch (b.*) {
+                .factorial => |second| try first.equals(alloc, second),
                 else => false,
             },
         };
@@ -367,6 +392,23 @@ const Expression = union(enum) {
                     } else if (exponent.equals(Numeric.ZERO)) {
                         // Simplify power of 0
                         self.* = Expression.newInteger(1);
+                    },
+                    else => {},
+                }
+            },
+            .factorial => |value| {
+                try value.collapsed_nested(alloc);
+                switch (value.*) {
+                    .integer => |max| {
+                        if (max.denominator == 1) {
+                            var result: i32 = 1;
+                            var item: i32 = 1;
+                            while (item <= max.numerator) {
+                                result *= item;
+                                item += 1;
+                            }
+                            self.* = Expression.newInteger(result);
+                        }
                     },
                     else => {},
                 }
@@ -456,7 +498,7 @@ const Expression = union(enum) {
             .power => |values| {
                 switch (values[1]) {
                     // Expand integer powers
-                    .integer => |i| if (i.denominator == 1 and i.numerator > 0) {
+                    .integer => |i| if (i.denominator == 1 and i.numerator > 0 and i.numerator < 6) {
                         var list: std.ArrayListUnmanaged(Expression) = .empty;
                         try list.appendNTimes(alloc, values[0], @intCast(i.numerator));
                         self.* = Expression{ .product = list };
@@ -469,6 +511,7 @@ const Expression = union(enum) {
                     },
                 }
             },
+            .factorial => |value| try value.*.expand_brakets(alloc),
             .integer, .variable => {},
         }
     }
@@ -549,6 +592,7 @@ const Expression = union(enum) {
                 try values[0].collect_like_terms(alloc);
                 try values[1].collect_like_terms(alloc);
             },
+            .factorial => |value| try value.collect_like_terms(alloc),
             .integer, .variable => {},
         }
         try self.collapsed_nested(alloc);
@@ -675,6 +719,11 @@ pub const Parser = struct {
 
         // While there are tokens left, keep attempting to get infix expressions
         while (self.current) |current| {
+            if (current.ty == TokenType.Exclaim) {
+                expression = try expression.newFactorial(self.allocator());
+                _ = try self.advance();
+                continue;
+            }
             const rule = Self.rule_for_token(current.ty) orelse break;
             const infix = rule.infix orelse {
                 // Could not find rule for token in an infix postion, assuming implict multiplication
@@ -753,7 +802,6 @@ test "Parse IntLit" {
     defer parsed.arena.deinit();
     try expect(Expression.newInteger(42), parsed.expression);
 }
-
 test "Parse Double negative" {
     var parsed = try testParser("--2");
     defer parsed.arena.deinit();
@@ -794,6 +842,10 @@ test "Simplify add" {
     try simplified_source_eq("a-a", "0");
     try simplified_source_eq("a+b+2a+5b", "3a+6b");
     try simplified_source_eq("a/3 - a/4", "a/12");
+}
+test "Simplify Factorial" {
+    try simplified_source_eq("4a!!", "4((a!)!)");
+    try std.testing.expectError(error.ExprNotEq, simplified_source_eq("4a!", "(4a)!"));
 }
 test "Simplify product" {
     try simplified_source_eq("2a*a*a", "2a^3");
